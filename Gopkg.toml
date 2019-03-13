@@ -43,7 +43,7 @@ required = [
   branch = "release-4.0"
 
 [[constraint]]
-  branch = "master"
+  branch = "schedules"
   name = "github.com/portworx/sched-ops"
 
 [[constraint]]

@@ -585,15 +585,15 @@
   revision = "1c18ebeaf685dfc584a49545bc590a13fa8b7617"
 
 [[projects]]
-  branch = "master"
-  digest = "1:4e75f297e0e75ecc4df1917c939d67e0887e129d0229c0512104a8060211efde"
+  branch = "schedules"
+  digest = "1:3552b66b69ebbdf0e3eb02a8778cc22d230bd179051638e72e71fde5600e2fe5"
   name = "github.com/portworx/sched-ops"
   packages = [
     "k8s",
     "task",
   ]
   pruneopts = "UT"
-  revision = "10d259768eb3b40dd1ce8a557920722cf237ed59"
+  revision = "93547eaee97b10bd1fe2bf04b3d279c95ff4d44c"
 
 [[projects]]
   branch = "master"
@@ -1479,6 +1479,7 @@
     "github.com/spf13/pflag",
     "github.com/stretchr/testify/require",
     "github.com/urfave/cli",
+    "gopkg.in/yaml.v2",
     "k8s.io/api/apps/v1",
     "k8s.io/api/apps/v1beta1",
     "k8s.io/api/apps/v1beta2",

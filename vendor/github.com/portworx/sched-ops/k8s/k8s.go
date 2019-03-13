@@ -28,11 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/version"
@@ -135,7 +133,7 @@ type NodeOps interface {
 	// RemoveLabelOnNode removes the label with key on given node
 	RemoveLabelOnNode(string, string) error
 	// WatchNode sets up a watcher that listens for the changes on Node.
-	WatchNode(node *v1.Node, fn NodeWatchFunc) error
+	WatchNode(node *v1.Node, fn WatchFunc) error
 	// CordonNode cordons the given node
 	CordonNode(nodeName string, timeout, retryInterval time.Duration) error
 	// UnCordonNode uncordons the given node
@@ -391,6 +389,16 @@ type SnapshotOps interface {
 	DeleteSnapshotData(name string) error
 	// ValidateSnapshotData validates the given snapshot data object
 	ValidateSnapshotData(name string, retry bool, timeout, retryInterval time.Duration) error
+	// GetSnapshotSchedule gets the SnapshotSchedule
+	GetSnapshotSchedule(string, string) (*v1alpha1.VolumeSnapshotSchedule, error)
+	// CreateSnapshotSchedule creates a SnapshotSchedule
+	CreateSnapshotSchedule(*v1alpha1.VolumeSnapshotSchedule) (*v1alpha1.VolumeSnapshotSchedule, error)
+	// UpdateSnapshotSchedule updates the SnapshotSchedule
+	UpdateSnapshotSchedule(*v1alpha1.VolumeSnapshotSchedule) (*v1alpha1.VolumeSnapshotSchedule, error)
+	// ListSnapshotSchedules lists all the SnapshotSchedules
+	ListSnapshotSchedules(string) (*v1alpha1.VolumeSnapshotScheduleList, error)
+	// DeleteSnapshotSchedule deletes the SnapshotSchedule
+	DeleteSnapshotSchedule(string, string) error
 }
 
 // GroupSnapshotOps is an interface to perform k8s GroupVolumeSnapshot operations
@@ -446,6 +454,8 @@ type ConfigMapOps interface {
 	DeleteConfigMap(name, namespace string) error
 	// UpdateConfigMap updates the given config map object
 	UpdateConfigMap(configMap *v1.ConfigMap) (*v1.ConfigMap, error)
+	// WatchConfigMap sets up a watcher that listens for changes on the config map
+	WatchConfigMap(configMap *v1.ConfigMap, fn WatchFunc) error
 }
 
 // CRDOps is an interface to perfrom k8s Customer Resource operations
@@ -866,39 +876,46 @@ func (k *k8sOps) RemoveLabelOnNode(name, key string) error {
 	return err
 }
 
-// NodeWatchFunc is a callback provided to the WatchNode function
-// which is invoked when the v1.Node object is changed.
-type NodeWatchFunc func(node *v1.Node) error
+// WatchFunc is a callback provided to the Watch functions
+// which is invoked when the given object is changed.
+type WatchFunc func(object runtime.Object) error
 
-// handleWatch is internal function that handles the Node-watch.  On channel shutdown (ie. stop watch),
+// handleWatch is internal function that handles the watch.  On channel shutdown (ie. stop watch),
 // it'll attempt to reestablish its watch function.
-func (k *k8sOps) handleWatch(watchInterface watch.Interface, node *v1.Node, watchNodeFn NodeWatchFunc) {
+func (k *k8sOps) handleWatch(watchInterface watch.Interface, object runtime.Object, fn WatchFunc) {
 	for {
 		select {
 		case event, more := <-watchInterface.ResultChan():
 			if !more {
-				logrus.Debug("Kubernetes NodeWatch closed (attempting to reestablish)")
+				logrus.Debug("Kubernetes watch closed (attempting to re-establish)")
 
 				t := func() (interface{}, bool, error) {
-					err := k.WatchNode(node, watchNodeFn)
+					var err error
+					if node, ok := object.(*v1.Node); ok {
+						err = k.WatchNode(node, fn)
+					} else if cm, ok := object.(*v1.ConfigMap); ok {
+						err = k.WatchConfigMap(cm, fn)
+					} else {
+						return "", false, fmt.Errorf("unsupported object: %v given to handle watch", object)
+					}
+
 					return "", true, err
 				}
+
 				if _, err := task.DoRetryWithTimeout(t, 10*time.Minute, 10*time.Second); err != nil {
-					logrus.WithError(err).Error("Could not reestablish the NodeWatch")
+					logrus.WithError(err).Error("Could not re-establish the watch")
 				} else {
-					logrus.Debug("NodeWatch reestablished")
+					logrus.Debug("watch re-established")
 				}
 				return
 			}
-			if k8sNode, ok := event.Object.(*v1.Node); ok {
-				// CHECKME: handle errors?
-				watchNodeFn(k8sNode)
-			}
+
+			fn(event.Object)
 		}
 	}
 }
 
-func (k *k8sOps) WatchNode(node *v1.Node, watchNodeFn NodeWatchFunc) error {
+func (k *k8sOps) WatchNode(node *v1.Node, watchNodeFn WatchFunc) error {
 	if node == nil {
 		return fmt.Errorf("no node given to watch")
 	}
@@ -907,22 +924,8 @@ func (k *k8sOps) WatchNode(node *v1.Node, watchNodeFn NodeWatchFunc) error {
 		return err
 	}
 
-	nodeHostname, has := node.GetLabels()[hostnameKey]
-	if !has || nodeHostname == "" {
-		return fmt.Errorf("no hostname label")
-	}
-
-	requirement, err := labels.NewRequirement(
-		hostnameKey,
-		selection.DoubleEquals,
-		[]string{nodeHostname},
-	)
-	if err != nil {
-		return fmt.Errorf("Could not create Label requirement: %s", err)
-	}
-
 	listOptions := meta_v1.ListOptions{
-		LabelSelector: requirement.String(),
+		FieldSelector: fields.OneTermEqualSelector("metadata.name", node.Name).String(),
 		Watch:         true,
 	}
 
@@ -2778,6 +2781,47 @@ func (k *k8sOps) DeleteSnapshotData(name string) error {
 		Do().Error()
 }
 
+func (k *k8sOps) GetSnapshotSchedule(name string, namespace string) (*v1alpha1.VolumeSnapshotSchedule, error) {
+	if err := k.initK8sClient(); err != nil {
+		return nil, err
+	}
+
+	return k.storkClient.Stork().VolumeSnapshotSchedules(namespace).Get(name, meta_v1.GetOptions{})
+}
+
+func (k *k8sOps) ListSnapshotSchedules(namespace string) (*v1alpha1.VolumeSnapshotScheduleList, error) {
+	if err := k.initK8sClient(); err != nil {
+		return nil, err
+	}
+
+	return k.storkClient.Stork().VolumeSnapshotSchedules(namespace).List(meta_v1.ListOptions{})
+}
+
+func (k *k8sOps) CreateSnapshotSchedule(snapshotSchedule *v1alpha1.VolumeSnapshotSchedule) (*v1alpha1.VolumeSnapshotSchedule, error) {
+	if err := k.initK8sClient(); err != nil {
+		return nil, err
+	}
+
+	return k.storkClient.Stork().VolumeSnapshotSchedules(snapshotSchedule.Namespace).Create(snapshotSchedule)
+}
+
+func (k *k8sOps) UpdateSnapshotSchedule(snapshotSchedule *v1alpha1.VolumeSnapshotSchedule) (*v1alpha1.VolumeSnapshotSchedule, error) {
+	if err := k.initK8sClient(); err != nil {
+		return nil, err
+	}
+
+	return k.storkClient.Stork().VolumeSnapshotSchedules(snapshotSchedule.Namespace).Update(snapshotSchedule)
+}
+func (k *k8sOps) DeleteSnapshotSchedule(name string, namespace string) error {
+	if err := k.initK8sClient(); err != nil {
+		return err
+	}
+
+	return k.storkClient.Stork().VolumeSnapshotSchedules(namespace).Delete(name, &meta_v1.DeleteOptions{
+		PropagationPolicy: &deleteForegroundPolicy,
+	})
+}
+
 // Snapshot APIs - END
 
 // GroupSnapshot APIs - BEGIN
@@ -3061,6 +3105,27 @@ func (k *k8sOps) UpdateConfigMap(configMap *v1.ConfigMap) (*v1.ConfigMap, error)
 	}
 
 	return k.client.CoreV1().ConfigMaps(ns).Update(configMap)
+}
+
+func (k *k8sOps) WatchConfigMap(configMap *v1.ConfigMap, fn WatchFunc) error {
+	if err := k.initK8sClient(); err != nil {
+		return err
+	}
+
+	listOptions := meta_v1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("metadata.name", configMap.Name).String(),
+		Watch:         true,
+	}
+
+	watchInterface, err := k.client.Core().ConfigMaps(configMap.Namespace).Watch(listOptions)
+	if err != nil {
+		logrus.WithError(err).Error("error invoking the watch api for config maps")
+		return err
+	}
+
+	// fire off watch function
+	go k.handleWatch(watchInterface, configMap, fn)
+	return nil
 }
 
 // ConfigMap APIs - END
@@ -3465,7 +3530,7 @@ func (k *k8sOps) GetObject(object runtime.Object) (runtime.Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.Get(metadata.GetName(), metav1.GetOptions{}, "")
+	return client.Get(metadata.GetName(), meta_v1.GetOptions{}, "")
 }
 
 // UpdateObject updates a generic Object
